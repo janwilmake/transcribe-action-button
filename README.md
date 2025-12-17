@@ -9,6 +9,7 @@ To set this up, you need accounts at Cloudflare, Deepgram, Sendgrid, and Twilio,
 IDEAS
 
 - Instead of emailing a transcript, connect this to the [Parallel Task API](https://parallel.ai) and create a simple dashboard for your past researches. It may be better to connecgt it to the [Parallel Task MCP](https://github.com/parallel-web/task-mcp)
+- Instead of task API, connect it to your personal file system so you can do any type of generations from here, or also, just make notes.
 - **Monetize this**: add a way so people can easily monetize this as a SaaS connected to Parallel.
 
 Challenges
