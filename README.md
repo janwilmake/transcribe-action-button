@@ -4,7 +4,12 @@ This repo contains a way for you to create an AI contact that transcribes the re
 
 From the email, you can further connect it to all kinds of AI tools using platforms like Zapier, Make, or N8N.
 
-To set this up, you need accounts at Cloudflare, Deepgram, Sendgrid, and Twilio, and copy the [.env.example](.env.example) to [.env](.env), then fill the required secrets from the respective accounts. Also, be sure to deploy this worker on Cloudflare using [wrangler](https://developers.cloudflare.com/workers/wrangler/install-and-update/).
+To set this up, you need accounts at Cloudflare, Deepgram, Cloudflare Email, and Twilio, and copy the [.env.example](.env.example) to [.env](.env), then fill the required secrets from the respective accounts. Also, be sure to deploy this worker on Cloudflare using [wrangler](https://developers.cloudflare.com/workers/wrangler/install-and-update/).
+
+TODO
+
+- Update to use cloudflare email rather than Sendgrid, which costs $30/month
+- Set it up for myself with cloudflare email
 
 IDEAS
 

@@ -68,10 +68,9 @@ async function handleInitialCall(request: Request): Promise<Response> {
   // TwiML response to record the call
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say>Welcome to Screenless. Your call is being recorded. Please leave your message after the beep.</Say>
   <Record 
     timeout="10" 
-    maxLength="600"
+    maxLength="3600"
     playBeep="true"
     recordingStatusCallback="${new URL(
       "/recording-complete",
@@ -120,7 +119,7 @@ async function handleRecordingComplete(
     await waitForRecording(recordingUrl, env);
 
     // Transcribe the recording
-    const transcript = await transcribeRecording(recordingUrl, env, from);
+    const transcript = await transcribeRecording(recordingUrl, env);
 
     if (!transcript || !transcript.transcript) {
       console.error("Failed to get transcript");
@@ -154,19 +153,10 @@ async function waitForRecording(
 ): Promise<void> {
   for (let i = 0; i < maxAttempts; i++) {
     try {
-      const response = await fetch(url, {
-        method: "HEAD",
-        headers: {
-          Authorization:
-            "Basic " +
-            btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`),
-        },
-      });
+      const response = await fetch(url, { method: "GET" });
 
-      if (
-        response.ok &&
-        response.headers.get("Content-Type")?.includes("audio")
-      ) {
+      if (response.ok) {
+        await response.arrayBuffer();
         return;
       }
     } catch (e) {
@@ -186,7 +176,6 @@ async function waitForRecording(
 async function transcribeRecording(
   audioUrl: string,
   env: Env,
-  speakerIdentifier?: string,
 ): Promise<DeepgramTranscript | null> {
   try {
     const response = await fetch("https://api.deepgram.com/v1/listen", {
@@ -197,7 +186,8 @@ async function transcribeRecording(
       },
       body: JSON.stringify({
         url: audioUrl,
-        model: "nova-2-general",
+        model: "nova-3",
+        // language: "en",
         diarize: true,
         detect_language: true,
         smart_format: true,
@@ -213,7 +203,7 @@ async function transcribeRecording(
     }
 
     const result = await response.json();
-    return analyzeDeepgramResponse(result, speakerIdentifier);
+    return analyzeDeepgramResponse(result);
   } catch (error) {
     console.error("Error transcribing:", error);
     return null;
@@ -223,56 +213,56 @@ async function transcribeRecording(
 /**
  * Analyze Deepgram response and format transcript
  */
-function analyzeDeepgramResponse(
-  apiResult: any,
-  speakerIdentifier?: string,
-): DeepgramTranscript {
+function analyzeDeepgramResponse(apiResult: any): DeepgramTranscript {
+  console.log("Deepgram API result:", JSON.stringify(apiResult));
   const channels = apiResult.results?.channels || [];
 
   if (channels.length === 0) {
     return { transcript: "", transcriptHtml: "" };
   }
 
-  const words = channels[0]?.alternatives?.[0]?.words || [];
-  const paragraphs =
-    channels[0]?.alternatives?.[0]?.paragraphs?.paragraphs || [];
+  const transcript =
+    channels[0]?.alternatives?.map((a: any) => a.transcript).join("\n\n") || [];
 
-  let transcript = "";
-  let previousSpeaker = -1;
+  // const paragraphs =
+  //   channels[0]?.alternatives?.[0]?.paragraphs?.paragraphs || [];
 
-  for (const paragraph of paragraphs) {
-    for (const sentence of paragraph.sentences || []) {
-      const speaker = paragraph.speaker ?? 0;
-      const speakerLabel = speakerIdentifier || `Speaker ${speaker + 1}`;
+  // let transcript = "";
+  // let previousSpeaker = -1;
 
-      // Add speaker label if changed
-      if (speaker !== previousSpeaker) {
-        const minutes = Math.floor(sentence.start / 60);
-        const seconds = Math.floor(sentence.start % 60);
-        transcript += `\n\n${speakerLabel} (${minutes}:${seconds
-          .toString()
-          .padStart(2, "0")}): `;
-        previousSpeaker = speaker;
-      }
+  // for (const paragraph of paragraphs) {
+  //   for (const sentence of paragraph.sentences || []) {
+  //     const speaker = paragraph.speaker ?? 0;
+  //     const speakerLabel = `Speaker ${speaker + 1}`;
 
-      transcript += sentence.text + " ";
-    }
-  }
+  //     // Add speaker label if changed
+  //     if (speaker !== previousSpeaker) {
+  //       const minutes = Math.floor(sentence.start / 60);
+  //       const seconds = Math.floor(sentence.start % 60);
+  //       transcript += `\n\n${speakerLabel} (${minutes}:${seconds
+  //         .toString()
+  //         .padStart(2, "0")}): `;
+  //       previousSpeaker = speaker;
+  //     }
 
-  // Calculate confidence metrics
-  const confidences = words.map((w: any) => w.confidence || 0);
-  const avgConfidence =
-    confidences.length > 0
-      ? confidences.reduce((a: number, b: number) => a + b, 0) /
-        confidences.length
-      : 0;
+  //     transcript += sentence.text + " ";
+  //   }
+  // }
 
-  const uncertainWords = confidences.filter((c: number) => c < 0.7).length;
-  const uncertainPercentage =
-    confidences.length > 0 ? uncertainWords / confidences.length : 0;
+  // // Calculate confidence metrics
+  // const confidences = words.map((w: any) => w.confidence || 0);
+  // const avgConfidence =
+  //   confidences.length > 0
+  //     ? confidences.reduce((a: number, b: number) => a + b, 0) /
+  //       confidences.length
+  //     : 0;
 
-  // Count unique speakers
-  const speakers = new Set(paragraphs.map((p: any) => p.speaker ?? 0));
+  // const uncertainWords = confidences.filter((c: number) => c < 0.7).length;
+  // const uncertainPercentage =
+  //   confidences.length > 0 ? uncertainWords / confidences.length : 0;
+
+  // // Count unique speakers
+  // const speakers = new Set(paragraphs.map((p: any) => p.speaker ?? 0));
 
   // Convert to HTML
   const transcriptHtml = markdownToHtml(transcript.trim());
@@ -280,9 +270,9 @@ function analyzeDeepgramResponse(
   return {
     transcript: transcript.trim(),
     transcriptHtml,
-    averageWordConfidence: Math.round(avgConfidence * 1000) / 1000,
-    uncertainWordPercentage: Math.round(uncertainPercentage * 1000) / 1000,
-    speakerAmount: speakers.size,
+    // averageWordConfidence: Math.round(avgConfidence * 1000) / 1000,
+    // uncertainWordPercentage: Math.round(uncertainPercentage * 1000) / 1000,
+    // speakerAmount: speakers.size,
   };
 }
 
