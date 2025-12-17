@@ -8,7 +8,7 @@ To set this up, you need accounts at Cloudflare, Deepgram, Cloudflare Email, and
 
 TODO
 
-- Update to use cloudflare email rather than Sendgrid, which costs $30/month
+- Update to use [cloudflare email](https://developers.cloudflare.com/email-routing/email-workers/send-email-workers/) rather than Sendgrid, which costs $30/month
 - Set it up for myself with cloudflare email
 
 IDEAS
