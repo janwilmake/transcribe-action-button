@@ -1,71 +1,111 @@
-/**
- * Cloudflare Worker for Screenless Voice Recording
- *
- * This worker handles Twilio voice calls by:
- * 1. Recording incoming calls
- * 2. Transcribing the recording using Deepgram
- * 3. Sending the transcript via email using SendGrid
- * 4. Deleting the original recording from Twilio
- */
+/// <reference types="@cloudflare/workers-types" />
+import { DurableObject } from "cloudflare:workers";
 
-interface Env {
+export interface Env {
+  TranscriptStore: DurableObjectNamespace<TranscriptStore>;
   DEEPGRAM_SECRET: string;
-  SENDGRID_SECRET: string;
-  SENDGRID_FROM_EMAIL: string;
-  SENDGRID_FROM_NAME: string;
-  SENDGRID_TO_EMAIL: string;
   TWILIO_ACCOUNT_SID: string;
   TWILIO_AUTH_TOKEN: string;
+  PASSWORD: string;
 }
 
-interface TwilioCallWebhook {
-  From?: string;
-  To?: string;
-  CallSid?: string;
-  RecordingUrl?: string;
-  RecordingSid?: string;
-  RecordingDuration?: string;
-}
-
-interface DeepgramTranscript {
-  transcriptHtml?: string;
-  transcript?: string;
-  averageWordConfidence?: number;
-  speakerAmount?: number;
-  uncertainWordPercentage?: number;
+interface Transcript {
+  id: number;
+  created_at: string;
+  from_number: string;
+  duration: string;
+  transcript: string;
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<Response> {
+    const required = [
+      "DEEPGRAM_SECRET",
+      "TWILIO_ACCOUNT_SID",
+      "TWILIO_AUTH_TOKEN",
+      "PASSWORD",
+    ];
+    for (const key of required) {
+      if (!env[key as keyof Env]) {
+        return new Response(`Missing required env: ${key}`, { status: 500 });
+      }
+    }
 
-    // Handle initial call - start recording
+    const url = new URL(request.url);
+    const store = env.TranscriptStore.get(
+      env.TranscriptStore.idFromName("main"),
+    );
+
+    // Twilio webhooks - no auth needed
     if (url.pathname === "/record" && request.method === "POST") {
       return handleInitialCall(request);
     }
 
-    // Handle recording completion - transcribe and email
     if (url.pathname === "/recording-complete" && request.method === "POST") {
-      return handleRecordingComplete(request, env);
+      return handleRecordingComplete(request, env, store);
+    }
+
+    // API routes - require auth
+    if (url.pathname === "/api/login" && request.method === "POST") {
+      const body = (await request.json()) as { password?: string };
+      if (body.password === env.PASSWORD) {
+        return new Response(
+          JSON.stringify({ success: true, token: env.PASSWORD }),
+          {
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      }
+      return new Response(JSON.stringify({ success: false }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (url.pathname === "/api/transcripts" && request.method === "GET") {
+      if (!checkAuth(request, env)) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const transcripts = await store.list();
+      return new Response(JSON.stringify(transcripts), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (
+      url.pathname.startsWith("/api/transcripts/") &&
+      request.method === "DELETE"
+    ) {
+      if (!checkAuth(request, env)) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const id = parseInt(url.pathname.split("/").pop() || "0");
+      await store.delete(id);
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
     return new Response("Not Found", { status: 404 });
   },
-};
+} satisfies ExportedHandler<Env>;
 
-/**
- * Handle initial incoming call - respond with TwiML to start recording
- */
+function checkAuth(request: Request, env: Env): boolean {
+  const auth = request.headers.get("Authorization");
+  return auth === `Bearer ${env.PASSWORD}`;
+}
+
 async function handleInitialCall(request: Request): Promise<Response> {
   const formData = await request.text();
   const params = new URLSearchParams(formData);
-
   const from = params.get("From") || "Unknown";
   const to = params.get("To") || "Unknown";
-
   console.log(`Incoming call from ${from} to ${to}`);
 
-  // TwiML response to record the call
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Record 
@@ -82,22 +122,17 @@ async function handleInitialCall(request: Request): Promise<Response> {
   <Say>Thank you for your message. Goodbye.</Say>
 </Response>`;
 
-  return new Response(twiml, {
-    headers: { "Content-Type": "text/xml" },
-  });
+  return new Response(twiml, { headers: { "Content-Type": "text/xml" } });
 }
 
-/**
- * Handle recording completion - transcribe, email, and delete
- */
 async function handleRecordingComplete(
   request: Request,
   env: Env,
+  store: DurableObjectStub<TranscriptStore>,
 ): Promise<Response> {
   try {
     const formData = await request.text();
     const params = new URLSearchParams(formData);
-
     const recordingUrl = params.get("RecordingUrl");
     const recordingSid = params.get("RecordingSid");
     const from = params.get("From") || "Unknown";
@@ -105,37 +140,22 @@ async function handleRecordingComplete(
 
     if (!recordingUrl) {
       console.error("No recording URL provided");
-      return new Response(
-        '<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
-        {
-          headers: { "Content-Type": "text/xml" },
-        },
-      );
-    }
-
-    console.log(`Processing recording: ${recordingUrl}`);
-
-    // Wait for recording to be available
-    await waitForRecording(recordingUrl, env);
-
-    // Transcribe the recording
-    const transcript = await transcribeRecording(recordingUrl, env);
-
-    if (!transcript || !transcript.transcript) {
-      console.error("Failed to get transcript");
       return respondWithEmptyTwiML();
     }
 
-    // Send email with transcript
-    await sendTranscriptEmail(transcript, from, duration, recordingUrl, env);
+    console.log(`Processing recording: ${recordingUrl}`);
+    await waitForRecording(recordingUrl);
+    const transcript = await transcribeRecording(recordingUrl, env);
 
-    // Delete the original recording from Twilio
+    if (transcript) {
+      await store.add(from, duration, transcript);
+    }
+
     if (recordingSid) {
       await deleteRecording(recordingSid, env);
     }
 
     console.log("Processing complete");
-
     return respondWithEmptyTwiML();
   } catch (error) {
     console.error("Error processing recording:", error);
@@ -143,40 +163,24 @@ async function handleRecordingComplete(
   }
 }
 
-/**
- * Wait for recording to be available (with retries)
- */
-async function waitForRecording(
-  url: string,
-  env: Env,
-  maxAttempts = 10,
-): Promise<void> {
+async function waitForRecording(url: string, maxAttempts = 10): Promise<void> {
   for (let i = 0; i < maxAttempts; i++) {
     try {
       const response = await fetch(url, { method: "GET" });
-
       if (response.ok) {
         await response.arrayBuffer();
         return;
       }
-    } catch (e) {
-      // Ignore and retry
-    }
-
-    // Wait 1 second before retry
+    } catch (e) {}
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
-
   throw new Error("Recording not available after retries");
 }
 
-/**
- * Transcribe recording using Deepgram
- */
 async function transcribeRecording(
   audioUrl: string,
   env: Env,
-): Promise<DeepgramTranscript | null> {
+): Promise<string | null> {
   try {
     const response = await fetch("https://api.deepgram.com/v1/listen", {
       method: "POST",
@@ -187,13 +191,11 @@ async function transcribeRecording(
       body: JSON.stringify({
         url: audioUrl,
         model: "nova-3",
-        // language: "en",
         diarize: true,
         detect_language: true,
         smart_format: true,
         punctuate: true,
         utterances: true,
-        summarize: true,
       }),
     });
 
@@ -202,200 +204,23 @@ async function transcribeRecording(
       return null;
     }
 
-    const result = await response.json();
-    return analyzeDeepgramResponse(result);
+    const result = (await response.json()) as any;
+    const channels = result.results?.channels || [];
+    if (channels.length === 0) return "";
+
+    return (
+      channels[0]?.alternatives?.map((a: any) => a.transcript).join("\n\n") ||
+      ""
+    );
   } catch (error) {
     console.error("Error transcribing:", error);
     return null;
   }
 }
 
-/**
- * Analyze Deepgram response and format transcript
- */
-function analyzeDeepgramResponse(apiResult: any): DeepgramTranscript {
-  console.log("Deepgram API result:", JSON.stringify(apiResult));
-  const channels = apiResult.results?.channels || [];
-
-  if (channels.length === 0) {
-    return { transcript: "", transcriptHtml: "" };
-  }
-
-  const transcript =
-    channels[0]?.alternatives?.map((a: any) => a.transcript).join("\n\n") || [];
-
-  // const paragraphs =
-  //   channels[0]?.alternatives?.[0]?.paragraphs?.paragraphs || [];
-
-  // let transcript = "";
-  // let previousSpeaker = -1;
-
-  // for (const paragraph of paragraphs) {
-  //   for (const sentence of paragraph.sentences || []) {
-  //     const speaker = paragraph.speaker ?? 0;
-  //     const speakerLabel = `Speaker ${speaker + 1}`;
-
-  //     // Add speaker label if changed
-  //     if (speaker !== previousSpeaker) {
-  //       const minutes = Math.floor(sentence.start / 60);
-  //       const seconds = Math.floor(sentence.start % 60);
-  //       transcript += `\n\n${speakerLabel} (${minutes}:${seconds
-  //         .toString()
-  //         .padStart(2, "0")}): `;
-  //       previousSpeaker = speaker;
-  //     }
-
-  //     transcript += sentence.text + " ";
-  //   }
-  // }
-
-  // // Calculate confidence metrics
-  // const confidences = words.map((w: any) => w.confidence || 0);
-  // const avgConfidence =
-  //   confidences.length > 0
-  //     ? confidences.reduce((a: number, b: number) => a + b, 0) /
-  //       confidences.length
-  //     : 0;
-
-  // const uncertainWords = confidences.filter((c: number) => c < 0.7).length;
-  // const uncertainPercentage =
-  //   confidences.length > 0 ? uncertainWords / confidences.length : 0;
-
-  // // Count unique speakers
-  // const speakers = new Set(paragraphs.map((p: any) => p.speaker ?? 0));
-
-  // Convert to HTML
-  const transcriptHtml = markdownToHtml(transcript.trim());
-
-  return {
-    transcript: transcript.trim(),
-    transcriptHtml,
-    // averageWordConfidence: Math.round(avgConfidence * 1000) / 1000,
-    // uncertainWordPercentage: Math.round(uncertainPercentage * 1000) / 1000,
-    // speakerAmount: speakers.size,
-  };
-}
-
-/**
- * Simple markdown to HTML converter
- */
-function markdownToHtml(markdown: string): string {
-  let html = markdown
-    .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>")
-    .replace(/\*(.*?)\*/g, "<em>$1</em>")
-    .replace(/\n\n/g, "</p><p>")
-    .replace(/\n/g, "<br>");
-
-  return `<p>${html}</p>`;
-}
-
-/**
- * Send transcript via email using SendGrid
- */
-async function sendTranscriptEmail(
-  transcript: DeepgramTranscript,
-  from: string,
-  duration: string,
-  recordingUrl: string,
-  env: Env,
-): Promise<void> {
-  const subject = `Screenless Recording from ${from}`;
-
-  const htmlContent = `
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <title>${subject}</title>
-</head>
-<body>
-  <h1>Screenless Recording</h1>
-  
-  <h2>Call Details</h2>
-  <ul>
-    <li><strong>From:</strong> ${from}</li>
-    <li><strong>Duration:</strong> ${duration} seconds</li>
-    <li><strong>Speakers:</strong> ${transcript.speakerAmount || 1}</li>
-    <li><strong>Confidence:</strong> ${(
-      (transcript.averageWordConfidence || 0) * 100
-    ).toFixed(1)}%</li>
-  </ul>
-  
-  <h2>Transcript</h2>
-  <div>
-    ${transcript.transcriptHtml || "<p>No transcript available</p>"}
-  </div>
-  
-  <hr>
-  <p><small>Recorded with Screenless - Original recording has been deleted for privacy</small></p>
-</body>
-</html>`;
-
-  const textContent = `
-Screenless Recording
-
-From: ${from}
-Duration: ${duration} seconds
-Speakers: ${transcript.speakerAmount || 1}
-Confidence: ${((transcript.averageWordConfidence || 0) * 100).toFixed(1)}%
-
-Transcript:
-${transcript.transcript || "No transcript available"}
-
----
-Recorded with Screenless - Original recording has been deleted for privacy
-`.trim();
-
-  try {
-    const response = await fetch("https://api.sendgrid.com/v3/mail/send", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${env.SENDGRID_SECRET}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        personalizations: [
-          {
-            to: [{ email: env.SENDGRID_TO_EMAIL }],
-          },
-        ],
-        from: {
-          email: env.SENDGRID_FROM_EMAIL,
-          name: env.SENDGRID_FROM_NAME || "Screenless",
-        },
-        subject,
-        content: [
-          {
-            type: "text/plain",
-            value: textContent,
-          },
-          {
-            type: "text/html",
-            value: htmlContent,
-          },
-        ],
-      }),
-    });
-
-    if (!response.ok) {
-      console.error("SendGrid error:", await response.text());
-      throw new Error("Failed to send email");
-    }
-
-    console.log("Email sent successfully");
-  } catch (error) {
-    console.error("Error sending email:", error);
-    throw error;
-  }
-}
-
-/**
- * Delete recording from Twilio
- */
 async function deleteRecording(recordingSid: string, env: Env): Promise<void> {
   try {
     const url = `https://api.twilio.com/2010-04-01/Accounts/${env.TWILIO_ACCOUNT_SID}/Recordings/${recordingSid}.json`;
-
     const response = await fetch(url, {
       method: "DELETE",
       headers: {
@@ -403,7 +228,6 @@ async function deleteRecording(recordingSid: string, env: Env): Promise<void> {
           "Basic " + btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`),
       },
     });
-
     if (response.ok) {
       console.log(`Recording ${recordingSid} deleted successfully`);
     } else {
@@ -414,9 +238,6 @@ async function deleteRecording(recordingSid: string, env: Env): Promise<void> {
   }
 }
 
-/**
- * Return empty TwiML response
- */
 function respondWithEmptyTwiML(): Response {
   return new Response(
     '<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
@@ -424,4 +245,43 @@ function respondWithEmptyTwiML(): Response {
       headers: { "Content-Type": "text/xml" },
     },
   );
+}
+
+export class TranscriptStore extends DurableObject<Env> {
+  private sql: SqlStorage;
+
+  constructor(state: DurableObjectState, env: Env) {
+    super(state, env);
+    this.sql = state.storage.sql;
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS transcripts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT DEFAULT (datetime('now')),
+        from_number TEXT,
+        duration TEXT,
+        transcript TEXT
+      )
+    `);
+  }
+
+  async add(from: string, duration: string, transcript: string): Promise<void> {
+    this.sql.exec(
+      "INSERT INTO transcripts (from_number, duration, transcript) VALUES (?, ?, ?)",
+      from,
+      duration,
+      transcript,
+    );
+  }
+
+  async list(): Promise<Transcript[]> {
+    return this.sql
+      .exec<Transcript>(
+        "SELECT id, created_at, from_number, duration, transcript FROM transcripts ORDER BY created_at DESC",
+      )
+      .toArray();
+  }
+
+  async delete(id: number): Promise<void> {
+    this.sql.exec("DELETE FROM transcripts WHERE id = ?", id);
+  }
 }
