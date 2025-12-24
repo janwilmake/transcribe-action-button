@@ -5,6 +5,7 @@ export interface Env {
   TranscriptStore: DurableObjectNamespace<TranscriptStore>;
   DEEPGRAM_SECRET: string;
   TWILIO_ACCOUNT_SID: string;
+  TWILIO_SID: string;
   TWILIO_AUTH_TOKEN: string;
   PASSWORD: string;
 }
@@ -225,7 +226,7 @@ async function deleteRecording(recordingSid: string, env: Env): Promise<void> {
       method: "DELETE",
       headers: {
         Authorization:
-          "Basic " + btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`),
+          "Basic " + btoa(`${env.TWILIO_SID}:${env.TWILIO_AUTH_TOKEN}`),
       },
     });
     if (response.ok) {
